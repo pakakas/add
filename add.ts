@@ -8,9 +8,10 @@ import { encode } from "../src/pap.ts";
 const papHelp = encodeMacro(mergeHelp({
   usage: "add <tool> [options]",
   command_desc: "Download and install Pakakas tools",
-  flag: ["--source", "-i", "--ascii"],
+  flag: ["--source", "--dev", "-i", "--ascii"],
   desc: [
-    "Download clean source code (degit style) instead of binary",
+    "Download clean source code (degit style, removes .git)",
+    "Download for development (git clone, keeps .git)",
     "Interactive mode with checklist",
     "Display formatted output"
   ]
@@ -55,7 +56,6 @@ async function downloadSource(tool: string, dest: string): Promise<boolean> {
         const buffer = await res.arrayBuffer();
         writeFileSync(tempFile, new Uint8Array(buffer));
 
-        // Use system tar for extraction with strip-components
         const proc = spawn(["tar", "-xzf", tempFile, "--strip-components=1", "-C", dest]);
         await proc.exited;
         
@@ -63,6 +63,20 @@ async function downloadSource(tool: string, dest: string): Promise<boolean> {
         return proc.exitCode === 0;
     } catch (e) {
         if (existsSync(tempFile)) unlinkSync(tempFile);
+        return false;
+    }
+}
+
+/**
+ * Clones repository for development (keeps .git).
+ */
+async function cloneDev(tool: string, dest: string): Promise<boolean> {
+    const url = `git@github.com:pakakas/${tool}.git`;
+    try {
+        const proc = spawn(["git", "clone", "--depth", "1", url, dest], { stdout: "inherit", stderr: "inherit" });
+        await proc.exited;
+        return proc.exitCode === 0;
+    } catch (e) {
         return false;
     }
 }
@@ -81,6 +95,7 @@ export async function run(args: string[], decoder?: (pap: string) => void) {
   }
 
   const isSource = args.includes("--source");
+  const isDev = args.includes("--dev");
   const isInteractive = args.includes("-i");
   const isAscii = args.includes("--ascii") || args.includes('--a') || isHumanHelp;
 
@@ -100,21 +115,41 @@ export async function run(args: string[], decoder?: (pap: string) => void) {
 
   for (const tool of toolsToInstall) {
     const toolDir = join(process.cwd(), tool);
+    if (existsSync(toolDir)) {
+        console.warn(`⚠️ Tool '${tool}' already exists. Skipping.`);
+        results.push({ tool, status: "SKIPPED", error: "Already exists" });
+        continue;
+    }
+
     try {
-        if (isSource) {
+        let mode = "binary";
+        if (isDev) {
+            console.log(`🛠️ Cloning development source for ${tool}...`);
+            const success = await cloneDev(tool, toolDir);
+            if (!success) throw new Error(`Failed to clone via SSH.`);
+            mode = "dev";
+        } else if (isSource) {
             console.log(`🌿 Scavenging source for ${tool}...`);
             const success = await downloadSource(tool, toolDir);
             if (!success) throw new Error(`Failed to download source via tarball.`);
-            results.push({ tool, mode: "source", status: "INSTALLED" });
+            mode = "source";
         } else {
             console.log(`📦 Downloading binary for ${tool}...`);
             const data = await downloadBinary(tool);
             if (!data) throw new Error(`Could not find binary on NPM or GitHub.`);
             
-            if (!existsSync(toolDir)) mkdirSync(toolDir);
+            mkdirSync(toolDir, { recursive: true });
             writeFileSync(join(toolDir, "ⓟ.js"), data);
-            results.push({ tool, mode: "binary", file: "ⓟ.js", status: "INSTALLED" });
         }
+
+        // Save Metadata
+        writeFileSync(join(toolDir, "ⓟ.json"), JSON.stringify({
+            tool,
+            mode,
+            installed_at: new Date().toISOString()
+        }, null, 2));
+
+        results.push({ tool, mode, status: "INSTALLED" });
     } catch (e) {
         results.push({ tool, status: "FAILED", error: (e as Error).message });
     }
