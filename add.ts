@@ -1,5 +1,6 @@
 import { join } from "node:path";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync, unlinkSync } from "node:fs";
+import { spawn } from "bun";
 import { encode as encodeMacro } from "../src/pap.ts" with { type: 'macro' };
 import { mergeHelp } from "../src/help.ts" with { type: 'macro' };
 import { encode } from "../src/pap.ts";
@@ -9,7 +10,7 @@ const papHelp = encodeMacro(mergeHelp({
   command_desc: "Download and install Pakakas tools",
   flag: ["--source", "-i", "--ascii"],
   desc: [
-    "Download TypeScript source instead of binary",
+    "Download clean source code (degit style) instead of binary",
     "Interactive mode with checklist",
     "Display formatted output"
   ]
@@ -20,25 +21,50 @@ export function help(decoder?: (pap: string) => void) {
   else process.stdout.write(papHelp + '\n');
 }
 
-const OFFICIAL_TOOLS = ["ls", "cat", "grep", "head", "tail", "wc", "cut", "dirname", "which", "rm", "lnwd", "unzip", "xargs", "timeout", "at", "sed", "psql", "powershell", "token-counter", "bun-link-g", "pakakasb", "gh"];
-
-async function downloadFile(tool: string, fileName: string): Promise<Uint8Array | null> {
+/**
+ * Downloads a single binary file.
+ */
+async function downloadBinary(tool: string): Promise<Uint8Array | null> {
     const urls = [
-        `https://unpkg.com/@pakakas/${tool}/${fileName}`,
-        `https://raw.githubusercontent.com/pakakas/${tool}/main/${fileName}`
+        `https://unpkg.com/@pakakas/${tool}/ⓟ.js`,
+        `https://raw.githubusercontent.com/pakakas/${tool}/main/ⓟ.js`
     ];
 
     for (const url of urls) {
         try {
-            console.log(`🔍 Trying ${url}...`);
             const res = await fetch(url);
-            if (res.ok) {
-                console.log(`✅ Found at ${url}`);
-                return new Uint8Array(await res.arrayBuffer());
-            }
+            if (res.ok) return new Uint8Array(await res.arrayBuffer());
         } catch (e) {}
     }
     return null;
+}
+
+/**
+ * Downloads and extracts source code using tarball (Mini-Degit style).
+ */
+async function downloadSource(tool: string, dest: string): Promise<boolean> {
+    const tarUrl = `https://github.com/pakakas/${tool}/archive/refs/heads/main.tar.gz`;
+    const tempFile = join(dest, `${tool}.tar.gz`);
+
+    try {
+        if (!existsSync(dest)) mkdirSync(dest, { recursive: true });
+
+        const res = await fetch(tarUrl);
+        if (!res.ok) return false;
+
+        const buffer = await res.arrayBuffer();
+        writeFileSync(tempFile, new Uint8Array(buffer));
+
+        // Use system tar for extraction with strip-components
+        const proc = spawn(["tar", "-xzf", tempFile, "--strip-components=1", "-C", dest]);
+        await proc.exited;
+        
+        unlinkSync(tempFile);
+        return proc.exitCode === 0;
+    } catch (e) {
+        if (existsSync(tempFile)) unlinkSync(tempFile);
+        return false;
+    }
 }
 
 export async function run(args: string[], decoder?: (pap: string) => void) {
@@ -56,14 +82,12 @@ export async function run(args: string[], decoder?: (pap: string) => void) {
 
   const isSource = args.includes("--source");
   const isInteractive = args.includes("-i");
-  const isAscii = args.includes("--ascii") || args.includes("--a") || isHumanHelp;
+  const isAscii = args.includes("--ascii") || args.includes('--a') || isHumanHelp;
 
   const toolsToInstall: string[] = args.filter(a => !a.startsWith("-"));
 
   if (isInteractive) {
-      // In a real agent environment, we would use ask_user here.
-      // For now, let's assume the user wants everything if no tools specified.
-      console.log("Interactive mode not fully implemented in CLI yet. Use 'add <tool>' for now.");
+      console.log("Interactive mode not fully implemented. Use 'add <tool>' for now.");
       return;
   }
 
@@ -75,26 +99,22 @@ export async function run(args: string[], decoder?: (pap: string) => void) {
   const results: any[] = [];
 
   for (const tool of toolsToInstall) {
+    const toolDir = join(process.cwd(), tool);
     try {
-        const fileName = isSource ? `${tool}.ts` : "ⓟ.js";
-        console.log(`Box Installing ${tool} (${fileName})...`);
-        
-        const data = await downloadFile(tool, fileName);
-        if (!data) throw new Error(`Could not find ${fileName} for tool '${tool}' on NPM or GitHub.`);
-
-        const toolDir = join(process.cwd(), tool);
-        if (!existsSync(toolDir)) mkdirSync(toolDir);
-
-        const targetPath = join(toolDir, fileName);
-        writeFileSync(targetPath, data);
-
-        // Also try to download package.json if in source mode
         if (isSource) {
-            const pkgData = await downloadFile(tool, "package.json");
-            if (pkgData) writeFileSync(join(toolDir, "package.json"), pkgData);
+            console.log(`🌿 Scavenging source for ${tool}...`);
+            const success = await downloadSource(tool, toolDir);
+            if (!success) throw new Error(`Failed to download source via tarball.`);
+            results.push({ tool, mode: "source", status: "INSTALLED" });
+        } else {
+            console.log(`📦 Downloading binary for ${tool}...`);
+            const data = await downloadBinary(tool);
+            if (!data) throw new Error(`Could not find binary on NPM or GitHub.`);
+            
+            if (!existsSync(toolDir)) mkdirSync(toolDir);
+            writeFileSync(join(toolDir, "ⓟ.js"), data);
+            results.push({ tool, mode: "binary", file: "ⓟ.js", status: "INSTALLED" });
         }
-
-        results.push({ tool, file: fileName, status: "INSTALLED" });
     } catch (e) {
         results.push({ tool, status: "FAILED", error: (e as Error).message });
     }
