@@ -1,13 +1,13 @@
 import { join, dirname, basename, resolve } from "node:path";
-import { existsSync, mkdirSync, writeFileSync, unlinkSync, readFileSync, readdirSync, lstatSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync, unlinkSync, readFileSync, rmSync } from "node:fs";
 import { spawn } from "bun";
 import { encode as encodeMacro } from "../src/pap.ts" with { type: 'macro' };
 import { mergeHelp } from "../src/help.ts" with { type: 'macro' };
-import { encode } from "../src/pap.ts";
+import { encode, decode } from "../src/pap.ts";
 
 const papHelp = encodeMacro(mergeHelp({
   usage: "add <src> [dest] [options]",
-  command_desc: "Scaffold tools or projects (tiged/degit style)",
+  command_desc: "Scaffold tools or projects with MarkZero directives",
   flag: ["--source", "--dev", "-f", "-i", "--ascii"],
   desc: [
     "Download clean source (removes .git)",
@@ -33,7 +33,7 @@ type RepoInfo = {
 };
 
 /**
- * Parses source string into structured repo info (tiged style).
+ * Parses source string into structured repo info.
  */
 function parseSrc(src: string): RepoInfo {
     const match = /^(?:(?:https:\/\/)?([^/]+\.[^:/]+)\/|git@([^:/]+)[:/]|([^/]+):)?([^/\s]+)\/([^/\s#]+)(?:((?:\/[^/\s#]+)+))?(?:\/)?(?:#(.+))?/.exec(src);
@@ -50,31 +50,40 @@ function parseSrc(src: string): RepoInfo {
 }
 
 /**
- * Handles directives from pakakas.json (like degit.json).
+ * Handles directives from pakakas.json (MARKZERO format).
  */
-async function runDirectives(dest: string) {
-    const configPath = join(dest, "pakakas.json");
-    if (!existsSync(configPath)) return;
+async function runDirectives(dest: string): Promise<any[]> {
+    const configPath = join(dest, "ⓟ.mz");
+    if (!existsSync(configPath)) return [];
 
+    const logs: any[] = [];
     try {
-        const config = JSON.parse(readFileSync(configPath, "utf-8"));
-        if (!Array.isArray(config)) return;
-
-        for (const action of config) {
-            if (action.action === "remove") {
-                const files = Array.isArray(action.files) ? action.files : [action.files];
-                for (const file of files) {
-                    const filePath = resolve(dest, file);
-                    if (existsSync(filePath)) {
-                        rmSync(filePath, { recursive: true, force: true });
+        const rawMz = readFileSync(configPath, "utf-8").trim();
+        // Decode MarkZero directives
+        const blocks = decode(rawMz);
+        
+        // Directives are expected to be a Grid/Set of actions
+        for (const block of blocks) {
+            if (Array.isArray(block)) {
+                for (const item of block) {
+                    if (item.action === "remove") {
+                        const files = Array.isArray(item.files) ? item.files : [item.files];
+                        for (const file of files) {
+                            const filePath = resolve(dest, file);
+                            if (existsSync(filePath)) {
+                                rmSync(filePath, { recursive: true, force: true });
+                                logs.push({ action: "remove", target: file, status: "DONE" });
+                            }
+                        }
                     }
                 }
             }
         }
-        unlinkSync(configPath); // Remove config after execution
+        unlinkSync(configPath);
     } catch (e) {
-        console.warn(`! Failed to run directives: ${(e as Error).message}`);
+        logs.push({ action: "directives", status: "FAILED", error: (e as Error).message });
     }
+    return logs;
 }
 
 async function downloadBinary(tool: string): Promise<Uint8Array | null> {
@@ -102,11 +111,9 @@ async function fetchTarball(repo: RepoInfo, dest: string): Promise<boolean> {
 
         await Bun.write(tempFile, await res.arrayBuffer());
 
-        // Calculate strip components: 1 (for root repo folder) + subdir depth
         const strip = 1 + (repo.subdir ? repo.subdir.split('/').filter(Boolean).length : 0);
         const tarArgs = ["-xzf", tempFile, `--strip-components=${strip}`, "-C", dest];
         if (repo.subdir) {
-            // Only extract the subdirectory
             const internalPath = `${repo.name}-${repo.ref}${repo.subdir.startsWith('/') ? '' : '/'}${repo.subdir}`;
             tarArgs.push(internalPath);
         }
@@ -159,18 +166,21 @@ export async function run(args: string[], decoder?: (pap: string) => void) {
           throw new Error(`Directory not empty. Use -f to override.`);
       }
 
-      // If it's a simple name and not in source/dev mode, try binary first
+      let mode = "binary";
+      let logPayload: any[] = [];
+
       if (!sourceStr.includes("/") && !flags.source && !flags.dev) {
           console.log(`📦 Downloading binary for ${sourceStr}...`);
           const data = await downloadBinary(sourceStr);
           if (data) {
               if (!existsSync(targetPath)) mkdirSync(targetPath, { recursive: true });
               writeFileSync(join(targetPath, "ⓟ.js"), data);
-              return { tool: sourceStr, mode: "binary", status: "INSTALLED" };
+          } else {
+              // fallback to source
+              flags.source = true;
           }
       }
 
-      // Development mode (git clone)
       if (flags.dev) {
           console.log(`🛠️ Cloning ${sourceStr} for development...`);
           const repo = sourceStr.includes("/") ? sourceStr : `pakakas/${sourceStr}`;
@@ -178,18 +188,27 @@ export async function run(args: string[], decoder?: (pap: string) => void) {
           const proc = spawn(["git", "clone", "--depth", "1", url, targetPath], { stdout: "inherit", stderr: "inherit" });
           await proc.exited;
           if (proc.exitCode !== 0) throw new Error("Git clone failed.");
-          return { tool: sourceStr, mode: "dev", status: "INSTALLED" };
+          mode = "dev";
+      } else if (flags.source) {
+          console.log(`🌿 Scavenging ${sourceStr}...`);
+          const repoPath = sourceStr.includes("/") ? sourceStr : `pakakas/${sourceStr}`;
+          const info = parseSrc(repoPath);
+          const success = await fetchTarball(info, targetPath);
+          if (!success) throw new Error("Extraction failed.");
+
+          // Run MarkZero Directives
+          logPayload = await runDirectives(targetPath);
+          mode = "source";
       }
 
-      // Scaffolding / Source mode (tarball)
-      console.log(`🌿 Scavenging ${sourceStr}...`);
-      const repoPath = sourceStr.includes("/") ? sourceStr : `pakakas/${sourceStr}`;
-      const info = parseSrc(repoPath);
-      const success = await fetchTarball(info, targetPath);
-      if (!success) throw new Error("Extraction failed.");
+      // Save Metadata
+      writeFileSync(join(targetPath, "ⓟ.json"), JSON.stringify({
+          tool: sourceStr,
+          mode,
+          installed_at: new Date().toISOString()
+      }, null, 2));
 
-      await runDirectives(targetPath);
-      return { tool: sourceStr, mode: "source", status: "INSTALLED" };
+      return { tool: sourceStr, mode, status: "INSTALLED", directives: logPayload.length > 0 ? logPayload : "NONE" };
   };
 
   try {
